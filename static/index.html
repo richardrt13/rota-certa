@@ -52,19 +52,19 @@
     <button type="button" id="pin-mode-btn" class="btn-secondary" onclick="togglePinMode()">+ Bloqueio no Mapa</button>
     <a id="gmaps-btn" href="#" target="_blank" rel="noopener">Abrir no Google Maps ↗</a>
 
-    <div id="status">Digite ao menos 3 letras para ver sugestões de endereços no RJ, ou clique no mapa (esquerdo = Origem, direito = Destino).</div>
+    <div id="status">Digite ao menos 3 letras para ver sugestões no RJ. Toque em um círculo vermelho para remover um bloqueio.</div>
   </div>
   <div id="map"></div>
 
   <script>
-    // Caixa geográfica da Região Metropolitana do Rio de Janeiro
     const RIO_BBOX = '-43.796,-23.082,-43.099,-22.746';
 
-    let selectedOrigin = null; // [lat, lng]
-    let selectedDest = null;   // [lat, lng]
+    let selectedOrigin = null;
+    let selectedDest = null;
     let originMarker = null;
     let destMarker = null;
     let pinDangerMode = false;
+    let activePopup = null;
 
     const map = new maplibregl.Map({
       container: 'map',
@@ -72,6 +72,15 @@
       center: [-43.22, -22.89],
       zoom: 11
     });
+
+    function getAdminPin() {
+      let pin = localStorage.getItem('rota_certa_admin_pin') || '';
+      if (!pin) {
+        pin = prompt('Digite o ADMIN_PIN configurado no Render:') || '';
+        if (pin) localStorage.setItem('rota_certa_admin_pin', pin);
+      }
+      return pin;
+    }
 
     function setMarker(type, lat, lng, label) {
       if (type === 'origin') {
@@ -173,28 +182,71 @@
 
     map.on('load', loadMapLayers);
 
+    window.deleteZone = async (zoneId) => {
+      const pin = getAdminPin();
+      const res = await fetch(`/api/avoid-zones/${zoneId}`, {
+        method: 'DELETE',
+        headers: { 'X-Admin-Pin': pin }
+      });
+      if (res.status === 401) {
+        localStorage.removeItem('rota_certa_admin_pin');
+        alert('PIN administrativo inválido. Tente novamente.');
+        return;
+      }
+      if (res.ok) {
+        if (activePopup) activePopup.remove();
+        await loadMapLayers();
+        document.getElementById('status').textContent = '🗑️ Bloqueio removido com sucesso.';
+      }
+    };
+
     map.on('click', async (e) => {
       const { lng, lat } = e.lngLat;
+
       if (pinDangerMode) {
         togglePinMode();
-        const nome = prompt('Nome deste ponto crítico (ex: Saída 4 Linha Amarela - Del Castilho):');
+        const nome = prompt('Nome deste ponto crítico (ex: Saída 4 Linha Amarela):');
         if (!nome) return;
         const raioStr = prompt('Raio de bloqueio em metros (padrão 350m):', '350');
         const radiusMeters = Math.max(100, Math.min(2000, parseInt(raioStr || '350', 10)));
+        const pin = getAdminPin();
 
         const res = await fetch('/api/avoid-zones', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Admin-Pin': pin },
           body: JSON.stringify({ name: nome, lat, lng, radius_meters: radiusMeters })
         });
+        if (res.status === 401) {
+          localStorage.removeItem('rota_certa_admin_pin');
+          alert('PIN administrativo inválido. Clique em + Bloqueio no Mapa novamente.');
+          return;
+        }
         if (res.ok) {
           await loadMapLayers();
-          document.getElementById('status').textContent = `✅ Bloqueio "${nome}" (${radiusMeters}m) salvo no Neon!`;
-        } else {
-          alert('Erro ao salvar ponto crítico. Verifique se o Passo 2 já foi aplicado no main.py.');
+          document.getElementById('status').textContent = `✅ Bloqueio "${nome}" (${radiusMeters}m) salvo!`;
         }
         return;
       }
+
+      // Verifica se clicou sobre uma zona vermelha existente para permitir exclusão
+      const hitZones = map.queryRenderedFeatures(e.point, { layers: ['avoid-fill'] });
+      if (hitZones.length > 0) {
+        const props = hitZones[0].properties;
+        if (activePopup) activePopup.remove();
+        activePopup = new maplibregl.Popup()
+          .setLngLat([lng, lat])
+          .setHTML(
+            `<div style="color:#111827;font-size:0.88rem;">
+              <strong>${props.name}</strong><br/>
+              <button onclick="deleteZone(${props.id})" style="margin-top:8px;padding:6px 10px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">
+                Remover bloqueio
+              </button>
+            </div>`
+          )
+          .addTo(map);
+        return;
+      }
+
       setMarker('origin', lat, lng, `${lat.toFixed(5)}, ${lng.toFixed(5)}`);
     });
 
@@ -203,7 +255,6 @@
       setMarker('dest', e.lngLat.lat, e.lngLat.lng, `${e.lngLat.lat.toFixed(5)}, ${e.lngLat.lng.toFixed(5)}`);
     });
 
-    // Autocomplete com debounce e filtro estrito no Rio de Janeiro
     function formatPhotonFeature(feat) {
       const p = feat.properties || {};
       const main = p.name || p.street || 'Local sem nome';
@@ -281,7 +332,6 @@
       const coordMatch = val.match(/^(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)$/);
       if (coordMatch) return [parseFloat(coordMatch[1]), parseFloat(coordMatch[2])];
 
-      // Fallback automático: pega o primeiro resultado do Rio caso o usuário não tenha clicado na lista
       const features = await searchRioPlaces(val);
       if (!features.length) throw new Error(`Endereço não encontrado no RJ: "${val}". Selecione uma sugestão da lista.`);
       const [lng, lat] = features[0].geometry.coordinates;

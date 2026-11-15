@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import asyncpg
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -19,6 +19,7 @@ load_dotenv()
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 ORS_API_KEY = os.environ["ORS_API_KEY"]
+ADMIN_PIN = os.environ.get("ADMIN_PIN", "")
 ORS_DIRECTIONS_URL = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
 RIO_TZ = ZoneInfo("America/Sao_Paulo")
 
@@ -47,6 +48,11 @@ class CustomAvoidZoneRequest(BaseModel):
     lat: float
     lng: float
     radius_meters: int = Field(default=350, ge=100, le=2000)
+
+
+def verify_admin_pin(x_admin_pin: str | None):
+    if ADMIN_PIN and x_admin_pin != ADMIN_PIN:
+        raise HTTPException(status_code=401, detail="PIN administrativo inválido.")
 
 
 def get_carjacking_time_multiplier() -> float:
@@ -159,14 +165,9 @@ def extract_arterial_step_waypoint(
     baseline_coords: List[List[float]],
     chosen_feature: dict,
 ) -> List[Tuple[float, float]]:
-    """
-    Extrai 1 waypoint exatamente sobre uma manobra (step) da rota escolhida
-    no ponto de maior afastamento em relação à rota padrão, evitando pistas contrárias.
-    """
     safe_coords = chosen_feature["geometry"]["coordinates"]
     baseline_line = LineString(baseline_coords)
 
-    # Coleta índices de início de cada manobra (step) no miolo da viagem
     step_indices = set()
     for seg in chosen_feature.get("properties", {}).get("segments", []):
         for step in seg.get("steps", []):
@@ -187,7 +188,6 @@ def extract_arterial_step_waypoint(
             max_dist = dist
             best_point = (round(lat, 6), round(lng, 6))
 
-    # Só injeta waypoint se a rota realmente divergir mais de ~300m da padrão do Google/ORS
     if best_point and max_dist > 0.0028:
         return [best_point]
     return []
@@ -213,6 +213,13 @@ def build_google_maps_url(
 @app.get("/")
 async def serve_ui():
     return FileResponse("static/index.html")
+
+
+@app.get("/health")
+async def health_check():
+    async with db_pool.acquire() as conn:
+        await conn.fetchval("SELECT 1;")
+    return {"status": "ok"}
 
 
 @app.get("/api/map-layers")
@@ -269,7 +276,11 @@ async def get_map_layers():
 
 
 @app.post("/api/avoid-zones")
-async def create_custom_avoid_zone(zone: CustomAvoidZoneRequest):
+async def create_custom_avoid_zone(
+    zone: CustomAvoidZoneRequest,
+    x_admin_pin: str | None = Header(default=None),
+):
+    verify_admin_pin(x_admin_pin)
     ext_id = f"manual_{uuid.uuid4().hex[:10]}"
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -290,6 +301,17 @@ async def create_custom_avoid_zone(zone: CustomAvoidZoneRequest):
             zone.radius_meters,
         )
     return {"status": "created", "external_id": ext_id}
+
+
+@app.delete("/api/avoid-zones/{zone_id}")
+async def delete_avoid_zone(
+    zone_id: int,
+    x_admin_pin: str | None = Header(default=None),
+):
+    verify_admin_pin(x_admin_pin)
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM avoid_zones WHERE id = $1;", zone_id)
+    return {"status": "deleted", "id": zone_id}
 
 
 @app.post("/api/safe-route")
@@ -318,7 +340,6 @@ async def compute_safe_route(req: RouteRequest):
     if len(results) > 1:
         candidate_features.extend(results[1].get("features", []))
 
-    # Avalia todas as rotas candidatas quanto a bloqueios rígidos e roubo de veículo
     evaluated = []
     for idx, feat in enumerate(candidate_features):
         coords = feat["geometry"]["coordinates"]
@@ -327,7 +348,6 @@ async def compute_safe_route(req: RouteRequest):
         cj = await evaluate_carjacking_exposure(coords)
         dur_min = feat["properties"]["summary"]["duration"] / 60.0
 
-        # Penalidade altíssima se cruzar bloqueio rígido; peso 0.35 min por ponto de risco de roubo
         hard_penalty = 10000.0 if hits else 0.0
         combined_cost = hard_penalty + dur_min + (cj["carjacking_score"] * 0.35)
 
@@ -348,12 +368,11 @@ async def compute_safe_route(req: RouteRequest):
     if best["index"] != 0:
         waypoints = extract_arterial_step_waypoint(baseline_coords, best["feature"])
 
-    # Monta explicação clara do porquê da escolha
     if base_eval["hits"] and not best["hits"]:
         reason = f"⚠️ Desvio de bloqueio ({', '.join(set(base_eval['hits']))}) | +{round(best['duration_min'] - base_eval['duration_min'], 1)} min"
     elif best["index"] != 0:
         risk_diff = round(base_eval["carjacking"]["carjacking_score"] - best["carjacking"]["carjacking_score"], 1)
-        time_diff = round(best["duration_min"] - base_eval["duration_min"], 1)
+        time_diff = round(best["duration_min"] - base_eval['duration_min'], 1)
         reason = f"🛡️ Rota alternativa mais segura (-{risk_diff} pts de risco, +{time_diff} min)"
     else:
         reason = "✅ Rota padrão já é a opção mais segura disponível"
