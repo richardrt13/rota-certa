@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from shapely.geometry import LineString, Point, shape
+from shapely.ops import unary_union
 
 load_dotenv()
 
@@ -34,7 +35,7 @@ async def lifespan(app: FastAPI):
     await db_pool.close()
 
 
-app = FastAPI(title="Rota Certa RJ - V1", lifespan=lifespan)
+app = FastAPI(title="Rota Certa RJ - V1.1", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -58,30 +59,32 @@ def verify_admin_pin(x_admin_pin: str | None):
 def get_carjacking_time_multiplier() -> float:
     hour = datetime.now(RIO_TZ).hour
     if 21 <= hour or hour < 5:
-        return 2.5   # Madrugada / noite
+        return 2.5
     if 18 <= hour < 21 or 5 <= hour < 7:
-        return 1.6   # Entardecer / início da manhã
+        return 1.6
     return 1.0
 
 
-async def fetch_corridor_avoid_zones(
-    origin: Tuple[float, float], destination: Tuple[float, float]
-) -> List[dict]:
-    min_lng = min(origin[1], destination[1]) - 0.12
-    min_lat = min(origin[0], destination[0]) - 0.12
-    max_lng = max(origin[1], destination[1]) + 0.12
-    max_lat = max(origin[0], destination[0]) + 0.12
-
+async def fetch_zones_near_corridors(candidate_lines: List[LineString]) -> List[dict]:
+    """
+    Busca apenas zonas de bloqueio num raio de 3 km das rotas candidatas.
+    Evita estourar o limite de 200 km² de avoid_polygons do OpenRouteService.
+    """
+    corridor_geom = unary_union(candidate_lines)
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, name, category, severity, ST_AsGeoJSON(geom) AS geojson
+            SELECT
+                id, name, category, severity,
+                ST_AsGeoJSON(geom) AS geojson,
+                ST_Distance(geom::geography, ST_GeomFromText($1, 4326)::geography) AS dist_m
             FROM avoid_zones
             WHERE (expires_at IS NULL OR expires_at > NOW())
-              AND geom && ST_MakeEnvelope($1, $2, $3, $4, 4326)
-            LIMIT 45;
+              AND ST_DWithin(geom::geography, ST_GeomFromText($1, 4326)::geography, 3000)
+            ORDER BY dist_m ASC
+            LIMIT 60;
             """,
-            min_lng, min_lat, max_lng, max_lat,
+            corridor_geom.wkt,
         )
     return [
         {
@@ -161,36 +164,54 @@ async def call_ors(
     return resp.json()
 
 
-def extract_arterial_step_waypoint(
+def extract_corridor_waypoints(
     baseline_coords: List[List[float]],
     chosen_feature: dict,
+    max_waypoints: int = 4,
 ) -> List[Tuple[float, float]]:
+    """
+    Extrai até 4 pontos sobre manobras (steps) distribuídos ao longo da rota segura
+    para impedir que o Google Maps volte a cortar por dentro de comunidades.
+    """
     safe_coords = chosen_feature["geometry"]["coordinates"]
+    n_coords = len(safe_coords)
+    if n_coords < 10:
+        return []
+
     baseline_line = LineString(baseline_coords)
 
-    step_indices = set()
-    for seg in chosen_feature.get("properties", {}).get("segments", []):
-        for step in seg.get("steps", []):
-            wp_range = step.get("way_points", [])
-            if wp_range:
-                step_indices.add(wp_range[0])
+    step_indices = sorted({
+        step["way_points"][0]
+        for seg in chosen_feature.get("properties", {}).get("segments", [])
+        for step in seg.get("steps", [])
+        if step.get("way_points")
+    })
+    if not step_indices:
+        step_indices = list(range(n_coords))
 
-    min_idx = max(1, len(safe_coords) // 8)
-    max_idx = len(safe_coords) - min_idx
-    candidate_indices = [i for i in step_indices if min_idx <= i <= max_idx] or list(range(min_idx, max_idx))
+    # Divide o trajeto em 4 fatias (15% a 85%) e escolhe 1 ponto de desvio por fatia
+    waypoints: List[Tuple[float, float]] = []
+    slice_bounds = [(0.15, 0.32), (0.33, 0.50), (0.51, 0.68), (0.69, 0.85)]
 
-    best_point = None
-    max_dist = 0.0
-    for idx in candidate_indices:
-        lng, lat = safe_coords[idx]
-        dist = baseline_line.distance(Point(lng, lat))
-        if dist > max_dist:
-            max_dist = dist
-            best_point = (round(lat, 6), round(lng, 6))
+    for start_pct, end_pct in slice_bounds:
+        if len(waypoints) >= max_waypoints:
+            break
+        i_min = int(n_coords * start_pct)
+        i_max = int(n_coords * end_pct)
+        bucket = [i for i in step_indices if i_min <= i <= i_max]
+        if not bucket:
+            continue
 
-    if best_point and max_dist > 0.0028:
-        return [best_point]
-    return []
+        best_idx = max(
+            bucket,
+            key=lambda idx: baseline_line.distance(Point(safe_coords[idx][0], safe_coords[idx][1])),
+        )
+        lng, lat = safe_coords[best_idx]
+        # Só adiciona se houver desvio real (> ~200m) em relação à rota padrão
+        if baseline_line.distance(Point(lng, lat)) > 0.0018:
+            waypoints.append((round(lat, 6), round(lng, 6)))
+
+    return waypoints
 
 
 def build_google_maps_url(
@@ -316,39 +337,46 @@ async def delete_avoid_zone(
 
 @app.post("/api/safe-route")
 async def compute_safe_route(req: RouteRequest):
-    zones = await fetch_corridor_avoid_zones(req.origin, req.destination)
-    zone_shapes = [(z, shape(z["geometry"])) for z in zones]
-
-    avoid_mp = None
-    if zones:
-        avoid_mp = {
-            "type": "MultiPolygon",
-            "coordinates": [z["geometry"]["coordinates"] for z in zones],
-        }
-
     async with httpx.AsyncClient(timeout=20.0) as client:
-        tasks = [call_ors(client, req.origin, req.destination, None, request_alternatives=True)]
-        if avoid_mp:
-            tasks.append(call_ors(client, req.origin, req.destination, avoid_mp, request_alternatives=False))
-        results = await asyncio.gather(*tasks)
+        # 1. Busca alternativas livres primeiro para mapear os corredores possíveis
+        alt_res = await call_ors(client, req.origin, req.destination, None, request_alternatives=True)
+        alt_features = alt_res.get("features", [])
+        if not alt_features:
+            raise HTTPException(status_code=404, detail="Nenhuma rota encontrada.")
 
-    alt_features = results[0].get("features", [])
-    baseline_feat = alt_features[0]
-    baseline_coords = baseline_feat["geometry"]["coordinates"]
+        baseline_feat = alt_features[0]
+        baseline_coords = baseline_feat["geometry"]["coordinates"]
+        candidate_lines = [LineString(f["geometry"]["coordinates"]) for f in alt_features]
 
-    candidate_features = list(alt_features)
-    if len(results) > 1:
-        candidate_features.extend(results[1].get("features", []))
+        # 2. Busca apenas zonas de bloqueio num raio de 3 km desses corredores
+        zones = await fetch_zones_near_corridors(candidate_lines)
+        zone_shapes = [(z, shape(z["geometry"])) for z in zones]
+
+        candidate_features = list(alt_features)
+
+        # 3. Se alguma alternativa invadir uma comunidade/bloqueio, pede rota com avoid_polygons
+        any_hit = any(
+            line.intersects(poly)
+            for line in candidate_lines
+            for _, poly in zone_shapes
+        )
+        if zones and any_hit:
+            avoid_mp = {
+                "type": "MultiPolygon",
+                "coordinates": [z["geometry"]["coordinates"] for z in zones],
+            }
+            safe_res = await call_ors(client, req.origin, req.destination, avoid_mp, request_alternatives=False)
+            candidate_features.extend(safe_res.get("features", []))
 
     evaluated = []
     for idx, feat in enumerate(candidate_features):
         coords = feat["geometry"]["coordinates"]
         line = LineString(coords)
-        hits = [z["name"] for z, poly in zone_shapes if line.intersects(poly)]
+        hits = list({z["name"] for z, poly in zone_shapes if line.intersects(poly)})
         cj = await evaluate_carjacking_exposure(coords)
         dur_min = feat["properties"]["summary"]["duration"] / 60.0
 
-        hard_penalty = 10000.0 if hits else 0.0
+        hard_penalty = 10000.0 * len(hits)
         combined_cost = hard_penalty + dur_min + (cj["carjacking_score"] * 0.35)
 
         evaluated.append({
@@ -366,13 +394,15 @@ async def compute_safe_route(req: RouteRequest):
 
     waypoints = []
     if best["index"] != 0:
-        waypoints = extract_arterial_step_waypoint(baseline_coords, best["feature"])
+        waypoints = extract_corridor_waypoints(baseline_coords, best["feature"], max_waypoints=4)
 
-    if base_eval["hits"] and not best["hits"]:
-        reason = f"⚠️ Desvio de bloqueio ({', '.join(set(base_eval['hits']))}) | +{round(best['duration_min'] - base_eval['duration_min'], 1)} min"
+    if base_eval["hits"] and len(best["hits"]) < len(base_eval["hits"]):
+        avoided_list = [h for h in base_eval["hits"] if h not in best["hits"]]
+        preview = ", ".join(avoided_list[:3]) + ("..." if len(avoided_list) > 3 else "")
+        reason = f"⚠️ Desvio aplicado (evitou: {preview}) | +{round(best['duration_min'] - base_eval['duration_min'], 1)} min"
     elif best["index"] != 0:
         risk_diff = round(base_eval["carjacking"]["carjacking_score"] - best["carjacking"]["carjacking_score"], 1)
-        time_diff = round(best["duration_min"] - base_eval['duration_min'], 1)
+        time_diff = round(best["duration_min"] - base_eval["duration_min"], 1)
         reason = f"🛡️ Rota alternativa mais segura (-{risk_diff} pts de risco, +{time_diff} min)"
     else:
         reason = "✅ Rota padrão já é a opção mais segura disponível"
