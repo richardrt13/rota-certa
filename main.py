@@ -10,8 +10,8 @@ from zoneinfo import ZoneInfo
 import asyncpg
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from shapely.geometry import LineString, Point, shape
@@ -23,21 +23,100 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 ORS_API_KEY = os.environ["ORS_API_KEY"]
 ADMIN_PIN = os.environ.get("ADMIN_PIN", "")
 ORS_DIRECTIONS_URL = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 RIO_TZ = ZoneInfo("America/Sao_Paulo")
 
+OVERPASS_QUERY = """
+[out:json][timeout:30];
+(
+  nwr["railway"="station"](-23.082,-43.796,-22.746,-43.099);
+  nwr["amenity"="police"](-23.082,-43.796,-22.746,-43.099);
+  nwr["amenity"="hospital"](-23.082,-43.796,-22.746,-43.099);
+);
+out center;
+"""
+
 db_pool: asyncpg.Pool | None = None
+
+
+async def ensure_and_seed_safe_pois():
+    """Cria a tabela safe_pois se não existir e popula via OpenStreetMap caso esteja vazia."""
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS safe_pois (
+                    id SERIAL PRIMARY KEY,
+                    external_id VARCHAR(100) UNIQUE,
+                    name VARCHAR(150) NOT NULL,
+                    category VARCHAR(50) NOT NULL,
+                    geom GEOMETRY(Point, 4326) NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_safe_pois_geom ON safe_pois USING GIST (geom);
+                """
+            )
+            count = await conn.fetchval("SELECT COUNT(*) FROM safe_pois;")
+            if count and count > 0:
+                return
+
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(OVERPASS_URL, data={"data": OVERPASS_QUERY})
+            resp.raise_for_status()
+            elements = resp.json().get("elements", [])
+
+        async with db_pool.acquire() as conn:
+            for el in elements:
+                tags = el.get("tags", {})
+                lat = el.get("lat") or (el.get("center") or {}).get("lat")
+                lng = el.get("lon") or (el.get("center") or {}).get("lon")
+                if lat is None or lng is None:
+                    continue
+
+                if tags.get("railway") == "station":
+                    category, default_name = "station", "Estação Metrô/Trem"
+                elif tags.get("amenity") == "police":
+                    category, default_name = "police", "Unidade Policial"
+                elif tags.get("amenity") == "hospital":
+                    category, default_name = "hospital", "Hospital"
+                else:
+                    continue
+
+                name = (tags.get("name") or default_name)[:145]
+                ext_id = f"osm_{el['type']}_{el['id']}"
+                await conn.execute(
+                    """
+                    INSERT INTO safe_pois (external_id, name, category, geom)
+                    VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326))
+                    ON CONFLICT (external_id) DO NOTHING;
+                    """,
+                    ext_id,
+                    name,
+                    category,
+                    float(lng),
+                    float(lat),
+                )
+    except Exception as exc:
+        print(f"Aviso ao sincronizar safe_pois: {exc}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    asyncio.create_task(ensure_and_seed_safe_pois())
     yield
     await db_pool.close()
 
 
-app = FastAPI(title="Rota Certa RJ - V2.1", lifespan=lifespan)
+app = FastAPI(title="Rota Certa RJ - V2.2", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content={"detail": f"Erro interno: {str(exc)}"})
 
 
 class RouteRequest(BaseModel):
@@ -78,60 +157,58 @@ def haversine_km(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
 async def discover_dynamic_safe_hubs(
     origin: Tuple[float, float], destination: Tuple[float, float]
 ) -> List[Tuple[str, Tuple[float, float]]]:
-    """
-    Projeta dois pontos laterais perpendiculares ao trajeto em metros (EPSG:31983)
-    e ancora cada flanco no polo seguro (estação, DP/batalhão ou hospital) localizado
-    na delegacia de menor risco e fora de zonas de bloqueio. Zero coordenadas fixas.
-    """
     direct_km = haversine_km(origin, destination)
     if direct_km < 6.0:
         return []
 
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            WITH endpoints AS (
-                SELECT
-                    ST_Transform(ST_SetSRID(ST_MakePoint($1, $2), 4326), 31983) AS p1,
-                    ST_Transform(ST_SetSRID(ST_MakePoint($3, $4), 4326), 31983) AS p2
-            ),
-            vectors AS (
-                SELECT
-                    ST_X(p2) - ST_X(p1) AS dx,
-                    ST_Y(p2) - ST_Y(p1) AS dy,
-                    (ST_X(p1) + ST_X(p2)) / 2.0 AS mx,
-                    (ST_Y(p1) + ST_Y(p2)) / 2.0 AS my
-                FROM endpoints
-            ),
-            lateral_targets AS (
-                SELECT 'Flanco A' AS side,
-                       ST_Transform(ST_SetSRID(ST_MakePoint(mx - 0.30 * dy, my + 0.30 * dx), 31983), 4326) AS target_geom
-                FROM vectors
-                UNION ALL
-                SELECT 'Flanco B' AS side,
-                       ST_Transform(ST_SetSRID(ST_MakePoint(mx + 0.30 * dy, my - 0.30 * dx), 31983), 4326) AS target_geom
-                FROM vectors
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH endpoints AS (
+                    SELECT
+                        ST_Transform(ST_SetSRID(ST_MakePoint($1, $2), 4326), 31983) AS p1,
+                        ST_Transform(ST_SetSRID(ST_MakePoint($3, $4), 4326), 31983) AS p2
+                ),
+                vectors AS (
+                    SELECT
+                        ST_X(p2) - ST_X(p1) AS dx,
+                        ST_Y(p2) - ST_Y(p1) AS dy,
+                        (ST_X(p1) + ST_X(p2)) / 2.0 AS mx,
+                        (ST_Y(p1) + ST_Y(p2)) / 2.0 AS my
+                    FROM endpoints
+                ),
+                lateral_targets AS (
+                    SELECT 'Flanco A' AS side,
+                           ST_Transform(ST_SetSRID(ST_MakePoint(mx - 0.30 * dy, my + 0.30 * dx), 31983), 4326) AS target_geom
+                    FROM vectors
+                    UNION ALL
+                    SELECT 'Flanco B' AS side,
+                           ST_Transform(ST_SetSRID(ST_MakePoint(mx + 0.30 * dy, my - 0.30 * dx), 31983), 4326) AS target_geom
+                    FROM vectors
+                )
+                SELECT DISTINCT ON (lt.side)
+                    sp.name AS hub_name,
+                    ST_Y(sp.geom) AS lat,
+                    ST_X(sp.geom) AS lng,
+                    pr.risk_index
+                FROM lateral_targets lt
+                JOIN safe_pois sp
+                  ON ST_DWithin(sp.geom::geography, lt.target_geom::geography, 4500)
+                JOIN precinct_risk pr
+                  ON ST_Intersects(sp.geom, pr.geom)
+                WHERE pr.risk_index < 55.0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM avoid_zones az
+                      WHERE (az.expires_at IS NULL OR az.expires_at > NOW())
+                        AND ST_DWithin(sp.geom::geography, az.geom::geography, 250)
+                  )
+                ORDER BY lt.side, pr.risk_index ASC, ST_Distance(sp.geom::geography, lt.target_geom::geography) ASC;
+                """,
+                origin[1], origin[0], destination[1], destination[0],
             )
-            SELECT DISTINCT ON (lt.side)
-                sp.name AS hub_name,
-                ST_Y(sp.geom) AS lat,
-                ST_X(sp.geom) AS lng,
-                pr.risk_index
-            FROM lateral_targets lt
-            JOIN safe_pois sp
-              ON ST_DWithin(sp.geom::geography, lt.target_geom::geography, 4500)
-            JOIN precinct_risk pr
-              ON ST_Intersects(sp.geom, pr.geom)
-            WHERE pr.risk_index < 55.0
-              AND NOT EXISTS (
-                  SELECT 1 FROM avoid_zones az
-                  WHERE (az.expires_at IS NULL OR az.expires_at > NOW())
-                    AND ST_DWithin(sp.geom::geography, az.geom::geography, 250)
-              )
-            ORDER BY lt.side, pr.risk_index ASC, ST_Distance(sp.geom::geography, lt.target_geom::geography) ASC;
-            """,
-            origin[1], origin[0], destination[1], destination[0],
-        )
+    except Exception:
+        return []
 
     hubs: List[Tuple[str, Tuple[float, float]]] = []
     seen_names = set()
@@ -176,40 +253,39 @@ async def fetch_zones_near_corridors(candidate_lines: List[LineString]) -> List[
 
 def analyze_road_hierarchy_and_speed(feature: dict) -> dict:
     coords = feature["geometry"]["coordinates"]
-    extras = feature.get("properties", {}).get("extras", {})
-    waytypes = extras.get("waytype", {}).get("values", [])
-    speeds = extras.get("avgspeed", {}).get("values", [])
-
-    if not waytypes or len(coords) < 2:
-        return {"arterial_share": 0.5, "local_share": 0.1, "slow_share": 0.1}
+    props = feature.get("properties", {})
+    waytypes = props.get("extras", {}).get("waytype", {}).get("values", [])
 
     arterial_deg = 0.0
     local_deg = 0.0
     total_deg = 0.0
 
-    for start_i, end_i, code in waytypes:
-        length = LineString(coords[start_i : end_i + 1]).length
-        total_deg += length
-        if code == 1:
-            arterial_deg += length
-        elif code >= 3:
-            local_deg += length
+    if waytypes and len(coords) >= 2:
+        for start_i, end_i, code in waytypes:
+            length = LineString(coords[start_i : end_i + 1]).length
+            total_deg += length
+            if code == 1:
+                arterial_deg += length
+            elif code >= 3:
+                local_deg += length
 
-    slow_deg = 0.0
-    speed_total_deg = 0.0
-    for start_i, end_i, speed_kmh in speeds:
-        length = LineString(coords[start_i : end_i + 1]).length
-        speed_total_deg += length
-        if speed_kmh < 22.0:
-            slow_deg += length
-
-    if total_deg <= 0:
-        return {"arterial_share": 0.5, "local_share": 0.1, "slow_share": 0.1}
+    # Calcula proporção de trechos lentos (< 22 km/h) direto dos steps nativos do ORS
+    slow_dist = 0.0
+    total_step_dist = 0.0
+    for seg in props.get("segments", []):
+        for step in seg.get("steps", []):
+            d_m = float(step.get("distance", 0.0))
+            t_s = float(step.get("duration", 0.0))
+            if d_m > 0 and t_s > 0:
+                total_step_dist += d_m
+                speed_kmh = (d_m / 1000.0) / (t_s / 3600.0)
+                if speed_kmh < 22.0:
+                    slow_dist += d_m
 
     return {
-        "arterial_share": arterial_deg / total_deg,
-        "local_share": local_deg / total_deg,
-        "slow_share": (slow_deg / speed_total_deg) if speed_total_deg > 0 else 0.1,
+        "arterial_share": (arterial_deg / total_deg) if total_deg > 0 else 0.5,
+        "local_share": (local_deg / total_deg) if total_deg > 0 else 0.1,
+        "slow_share": (slow_dist / total_step_dist) if total_step_dist > 0 else 0.1,
     }
 
 
@@ -252,15 +328,18 @@ async def evaluate_route_safety(feature: dict) -> dict:
             wkt_line,
         )
 
-        poi_rows = await conn.fetch(
-            """
-            SELECT category, COUNT(*) AS qty
-            FROM safe_pois
-            WHERE ST_DWithin(geom::geography, ST_GeomFromText($1, 4326)::geography, 250)
-            GROUP BY category;
-            """,
-            wkt_line,
-        )
+        try:
+            poi_rows = await conn.fetch(
+                """
+                SELECT category, COUNT(*) AS qty
+                FROM safe_pois
+                WHERE ST_DWithin(geom::geography, ST_GeomFromText($1, 4326)::geography, 250)
+                GROUP BY category;
+                """,
+                wkt_line,
+            )
+        except Exception:
+            poi_rows = []
 
     weighted_sum = 0.0
     covered_km = 0.0
@@ -324,7 +403,7 @@ async def call_ors(
         "coordinates": coords_lonlat,
         "radiuses": [1500] * len(coords_lonlat),
         "instructions": True,
-        "extra_info": ["waytype", "avgspeed"],
+        "extra_info": ["waytype"],
     }
     if avoid_multipolygon:
         body["options"] = {"avoid_polygons": avoid_multipolygon}
@@ -524,7 +603,9 @@ async def compute_safe_route(req: RouteRequest):
         initial_results = await asyncio.gather(*initial_tasks, return_exceptions=True)
 
         alt_res = initial_results[0]
-        if isinstance(alt_res, Exception) or not alt_res.get("features"):
+        if isinstance(alt_res, Exception):
+            raise HTTPException(status_code=502, detail=str(alt_res))
+        if not alt_res.get("features"):
             raise HTTPException(status_code=502, detail="Erro ao obter rotas iniciais.")
 
         alt_features = alt_res["features"]
