@@ -38,13 +38,13 @@
 <body>
   <div id="controls">
     <div class="input-group">
-      <input id="origin-input" type="text" autocomplete="off" placeholder="Origem (rua, shopping, estação ou GPS)" />
+      <input id="origin-input" type="text" autocomplete="off" placeholder="Origem (rua, bairro, cidade ou GPS)" />
       <button type="button" class="btn-secondary" onclick="useCurrentGPS()" title="Usar localização atual">📍 GPS</button>
       <div id="origin-suggestions" class="suggestions"></div>
     </div>
 
     <div class="input-group">
-      <input id="dest-input" type="text" autocomplete="off" placeholder="Destino no Rio de Janeiro..." />
+      <input id="dest-input" type="text" autocomplete="off" placeholder="Destino (Rio, Maricá, Niterói, Baixada...)" />
       <div id="dest-suggestions" class="suggestions"></div>
     </div>
 
@@ -67,8 +67,8 @@
     const map = new maplibregl.Map({
       container: 'map',
       style: 'https://tiles.openfreemap.org/styles/liberty',
-      center: [-43.22, -22.89],
-      zoom: 11
+      center: [-43.12, -22.90],
+      zoom: 10.5
     });
 
     function getAdminPin() {

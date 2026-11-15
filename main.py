@@ -29,9 +29,9 @@ RIO_TZ = ZoneInfo("America/Sao_Paulo")
 OVERPASS_QUERY = """
 [out:json][timeout:30];
 (
-  nwr["railway"="station"](-23.082,-43.796,-22.746,-43.099);
-  nwr["amenity"="police"](-23.082,-43.796,-22.746,-43.099);
-  nwr["amenity"="hospital"](-23.082,-43.796,-22.746,-43.099);
+  nwr["railway"="station"](-23.10,-43.85,-22.65,-42.50);
+  nwr["amenity"="police"](-23.10,-43.85,-22.65,-42.50);
+  nwr["amenity"="hospital"](-23.10,-43.85,-22.65,-42.50);
 );
 out center;
 """
@@ -58,7 +58,7 @@ async def ensure_and_seed_safe_pois():
                 """
             )
             count = await conn.fetchval("SELECT COUNT(*) FROM safe_pois;")
-            if count and count > 0:
+            if count and count > 1200:
                 return
 
         async with httpx.AsyncClient(timeout=45.0) as client:
@@ -725,10 +725,10 @@ async def autocomplete_places(q: str = ""):
             "boundary.country": "BRA",
             "focus.point.lat": -22.9068,
             "focus.point.lon": -43.1729,
-            "boundary.rect.min_lon": -43.796,
-            "boundary.rect.min_lat": -23.082,
-            "boundary.rect.max_lon": -43.099,
-            "boundary.rect.max_lat": -22.746,
+            "boundary.rect.min_lon": -44.90,
+            "boundary.rect.min_lat": -23.40,
+            "boundary.rect.max_lon": -40.95,
+            "boundary.rect.max_lat": -20.75,
             "size": 6,
         }
         headers = {"Authorization": ORS_API_KEY}
@@ -756,7 +756,7 @@ async def autocomplete_places(q: str = ""):
                         props.get("neighbourhood") or props.get("borough"),
                         props.get("locality") or props.get("county"),
                     ]
-                    sub = " • ".join(p for p in sub_parts if p)
+                    sub = " • ".join(x for x in sub_parts if x)
                     full = props.get("label") or (f"{main_name} - {sub}" if sub else main_name)
                     results.append({
                         "main": main_name,
@@ -777,21 +777,21 @@ async def autocomplete_places(q: str = ""):
                         "q": query,
                         "lat": -22.9068,
                         "lon": -43.1729,
-                        "bbox": "-43.796,-23.082,-43.099,-22.746",
-                        "limit": 5,
+                        "bbox": "-44.90,-23.40,-40.95,-20.75",
+                        "limit": 6,
                     },
                 )
                 if resp.status_code == 200:
                     for feat in resp.json().get("features", []):
-                        p = feat.get("properties", {})
+                        props = feat.get("properties", {})
                         coords = feat.get("geometry", {}).get("coordinates", [])
                         if len(coords) < 2:
                             continue
-                        main_name = p.get("name") or p.get("street") or "Local"
+                        main_name = props.get("name") or props.get("street") or "Local"
                         sub_parts = [
-                            p.get("street") if p.get("street") != main_name else None,
-                            p.get("district") or p.get("suburb"),
-                            p.get("city") or p.get("state"),
+                            props.get("street") if props.get("street") != main_name else None,
+                            props.get("district") or props.get("suburb"),
+                            props.get("city") or props.get("state"),
                         ]
                         sub = " • ".join(x for x in sub_parts if x)
                         full = (
