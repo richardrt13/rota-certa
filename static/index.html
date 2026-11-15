@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Rota Certa RJ</title>
+  <link rel="manifest" href="/static/manifest.json" />
+  <meta name="theme-color" content="#111827" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, sans-serif; display: flex; flex-direction: column; height: 100vh; background: #111827; }
+    #controls { padding: 12px; background: #111827; color: #f9fafb; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; z-index: 20; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+    .input-group { position: relative; flex: 1 1 250px; display: flex; gap: 4px; }
+    input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #374151; background: #1f2937; color: #fff; font-size: 0.95rem; }
+    input:focus { outline: none; border-color: #3b82f6; }
+    .suggestions { position: absolute; top: 100%; left: 0; right: 0; background: #1f2937; border: 1px solid #374151; border-radius: 8px; margin-top: 4px; max-height: 220px; overflow-y: auto; z-index: 50; display: none; box-shadow: 0 8px 16px rgba(0,0,0,0.5); }
+    .suggestion-item { padding: 10px 12px; cursor: pointer; border-bottom: 1px solid #374151; font-size: 0.88rem; }
+    .suggestion-item:last-child { border-bottom: none; }
+    .suggestion-item:hover { background: #374151; }
+    .suggestion-sub { display: block; font-size: 0.78rem; color: #9ca3af; margin-top: 2px; }
+    button { padding: 10px 14px; border-radius: 8px; border: none; background: #2563eb; color: #fff; font-weight: 600; cursor: pointer; font-size: 0.9rem; white-space: nowrap; }
+    button:hover { background: #1d4ed8; }
+    .btn-secondary { background: #374151; }
+    .btn-secondary:hover { background: #4b5563; }
+    .btn-danger-active { background: #dc2626 !important; animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.8; } }
+    #gmaps-btn { display: none; padding: 10px 14px; border-radius: 8px; background: #16a34a; color: #fff; text-decoration: none; font-weight: 700; font-size: 0.9rem; }
+    #status { width: 100%; font-size: 0.88rem; color: #e5e7eb; line-height: 1.45; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-weight: 700; font-size: 0.78rem; margin-right: 6px; }
+    .badge-low { background: #065f46; color: #a7f3d0; }
+    .badge-med { background: #92400e; color: #fde68a; }
+    .badge-high { background: #991b1b; color: #fecaca; }
+    #map { flex: 1; width: 100%; }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <div class="input-group">
+      <input id="origin-input" type="text" autocomplete="off" placeholder="Origem (digite rua/bairro ou use GPS)" />
+      <button type="button" class="btn-secondary" onclick="useCurrentGPS()" title="Usar localização atual">📍 GPS</button>
+      <div id="origin-suggestions" class="suggestions"></div>
+    </div>
+
+    <div class="input-group">
+      <input id="dest-input" type="text" autocomplete="off" placeholder="Destino no Rio de Janeiro..." />
+      <div id="dest-suggestions" class="suggestions"></div>
+    </div>
+
+    <button type="button" onclick="calculateSafeRoute()">Calcular Rota</button>
+    <button type="button" id="pin-mode-btn" class="btn-secondary" onclick="togglePinMode()">+ Bloqueio no Mapa</button>
+    <a id="gmaps-btn" href="#" target="_blank" rel="noopener">Abrir no Google Maps ↗</a>
+
+    <div id="status">Digite ao menos 3 letras para ver sugestões de endereços no RJ, ou clique no mapa (esquerdo = Origem, direito = Destino).</div>
+  </div>
+  <div id="map"></div>
+
+  <script>
+    // Caixa geográfica da Região Metropolitana do Rio de Janeiro
+    const RIO_BBOX = '-43.796,-23.082,-43.099,-22.746';
+
+    let selectedOrigin = null; // [lat, lng]
+    let selectedDest = null;   // [lat, lng]
+    let originMarker = null;
+    let destMarker = null;
+    let pinDangerMode = false;
+
+    const map = new maplibregl.Map({
+      container: 'map',
+      style: 'https://tiles.openfreemap.org/styles/liberty',
+      center: [-43.22, -22.89],
+      zoom: 11
+    });
+
+    function setMarker(type, lat, lng, label) {
+      if (type === 'origin') {
+        selectedOrigin = [lat, lng];
+        if (label) document.getElementById('origin-input').value = label;
+        if (originMarker) originMarker.remove();
+        originMarker = new maplibregl.Marker({ color: '#2563eb' }).setLngLat([lng, lat]).addTo(map);
+      } else {
+        selectedDest = [lat, lng];
+        if (label) document.getElementById('dest-input').value = label;
+        if (destMarker) destMarker.remove();
+        destMarker = new maplibregl.Marker({ color: '#16a34a' }).setLngLat([lng, lat]).addTo(map);
+      }
+    }
+
+    function useCurrentGPS() {
+      const statusEl = document.getElementById('status');
+      if (!navigator.geolocation) {
+        statusEl.textContent = 'Geolocalização não suportada neste navegador.';
+        return;
+      }
+      statusEl.textContent = 'Obtendo coordenadas GPS atuais...';
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const { latitude, longitude } = pos.coords;
+          setMarker('origin', latitude, longitude, `Minha Localização (${latitude.toFixed(4)}, ${longitude.toFixed(4)})`);
+          map.flyTo({ center: [longitude, latitude], zoom: 14 });
+          statusEl.textContent = 'Origem definida pelo GPS atual.';
+        },
+        (err) => {
+          statusEl.textContent = `Não foi possível obter GPS: ${err.message}`;
+        },
+        { enableHighAccuracy: true, timeout: 8000 }
+      );
+    }
+
+    function togglePinMode() {
+      pinDangerMode = !pinDangerMode;
+      const btn = document.getElementById('pin-mode-btn');
+      const statusEl = document.getElementById('status');
+      if (pinDangerMode) {
+        btn.classList.add('btn-danger-active');
+        btn.textContent = 'Clique no local de risco...';
+        statusEl.textContent = '⚠️ Modo de cadastro ativo: clique no mapa exatamente sobre a via/alça que deseja bloquear.';
+      } else {
+        btn.classList.remove('btn-danger-active');
+        btn.textContent = '+ Bloqueio no Mapa';
+      }
+    }
+
+    async function loadMapLayers() {
+      const layersResp = await fetch('/api/map-layers');
+      const layersData = await layersResp.json();
+
+      if (map.getSource('precinct-risk')) {
+        map.getSource('precinct-risk').setData(layersData.high_carjacking_precincts);
+        map.getSource('avoid-zones').setData(layersData.avoid_zones);
+        return;
+      }
+
+      map.addSource('precinct-risk', { type: 'geojson', data: layersData.high_carjacking_precincts });
+      map.addLayer({
+        id: 'precinct-fill',
+        type: 'fill',
+        source: 'precinct-risk',
+        paint: { 'fill-color': '#f59e0b', 'fill-opacity': 0.18 }
+      });
+
+      map.addSource('avoid-zones', { type: 'geojson', data: layersData.avoid_zones });
+      map.addLayer({
+        id: 'avoid-fill',
+        type: 'fill',
+        source: 'avoid-zones',
+        paint: { 'fill-color': '#ef4444', 'fill-opacity': 0.45 }
+      });
+      map.addLayer({
+        id: 'avoid-outline',
+        type: 'line',
+        source: 'avoid-zones',
+        paint: { 'line-color': '#b91c1c', 'line-width': 2 }
+      });
+
+      map.addSource('baseline-route', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+      map.addLayer({
+        id: 'baseline-line',
+        type: 'line',
+        source: 'baseline-route',
+        paint: { 'line-color': '#ef4444', 'line-width': 4, 'line-dasharray': [2, 2] }
+      });
+
+      map.addSource('safe-route', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+      map.addLayer({
+        id: 'safe-line',
+        type: 'line',
+        source: 'safe-route',
+        paint: { 'line-color': '#10b981', 'line-width': 6 }
+      });
+    }
+
+    map.on('load', loadMapLayers);
+
+    map.on('click', async (e) => {
+      const { lng, lat } = e.lngLat;
+      if (pinDangerMode) {
+        togglePinMode();
+        const nome = prompt('Nome deste ponto crítico (ex: Saída 4 Linha Amarela - Del Castilho):');
+        if (!nome) return;
+        const raioStr = prompt('Raio de bloqueio em metros (padrão 350m):', '350');
+        const radiusMeters = Math.max(100, Math.min(2000, parseInt(raioStr || '350', 10)));
+
+        const res = await fetch('/api/avoid-zones', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: nome, lat, lng, radius_meters: radiusMeters })
+        });
+        if (res.ok) {
+          await loadMapLayers();
+          document.getElementById('status').textContent = `✅ Bloqueio "${nome}" (${radiusMeters}m) salvo no Neon!`;
+        } else {
+          alert('Erro ao salvar ponto crítico. Verifique se o Passo 2 já foi aplicado no main.py.');
+        }
+        return;
+      }
+      setMarker('origin', lat, lng, `${lat.toFixed(5)}, ${lng.toFixed(5)}`);
+    });
+
+    map.on('contextmenu', (e) => {
+      e.preventDefault();
+      setMarker('dest', e.lngLat.lat, e.lngLat.lng, `${e.lngLat.lat.toFixed(5)}, ${e.lngLat.lng.toFixed(5)}`);
+    });
+
+    // Autocomplete com debounce e filtro estrito no Rio de Janeiro
+    function formatPhotonFeature(feat) {
+      const p = feat.properties || {};
+      const main = p.name || p.street || 'Local sem nome';
+      const subParts = [p.street !== main ? p.street : null, p.district || p.suburb, p.city || p.state].filter(Boolean);
+      return { main, sub: subParts.join(' • '), full: subParts.length ? `${main} - ${subParts[0]}` : main };
+    }
+
+    async function searchRioPlaces(query) {
+      const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&lat=-22.9068&lon=-43.1729&bbox=${RIO_BBOX}&limit=5`;
+      const res = await fetch(url);
+      const data = await res.json();
+      return data.features || [];
+    }
+
+    function setupAutocomplete(inputId, listId, type) {
+      const input = document.getElementById(inputId);
+      const list = document.getElementById(listId);
+      let timer = null;
+
+      input.addEventListener('input', () => {
+        if (type === 'origin') selectedOrigin = null;
+        else selectedDest = null;
+
+        clearTimeout(timer);
+        const q = input.value.trim();
+        if (q.length < 3) {
+          list.style.display = 'none';
+          return;
+        }
+
+        timer = setTimeout(async () => {
+          try {
+            const features = await searchRioPlaces(q);
+            list.innerHTML = '';
+            if (!features.length) {
+              list.innerHTML = '<div class="suggestion-item">Nenhum endereço encontrado no RJ. Tente incluir o bairro.</div>';
+              list.style.display = 'block';
+              return;
+            }
+            features.forEach((f) => {
+              const info = formatPhotonFeature(f);
+              const [lng, lat] = f.geometry.coordinates;
+              const div = document.createElement('div');
+              div.className = 'suggestion-item';
+              div.innerHTML = `<strong>${info.main}</strong><span class="suggestion-sub">${info.sub}</span>`;
+              div.onclick = () => {
+                setMarker(type, lat, lng, info.full);
+                list.style.display = 'none';
+                map.flyTo({ center: [lng, lat], zoom: 13 });
+              };
+              list.appendChild(div);
+            });
+            list.style.display = 'block';
+          } catch (e) {
+            list.style.display = 'none';
+          }
+        }, 300);
+      });
+
+      document.addEventListener('click', (e) => {
+        if (!input.contains(e.target) && !list.contains(e.target)) {
+          list.style.display = 'none';
+        }
+      });
+    }
+
+    setupAutocomplete('origin-input', 'origin-suggestions', 'origin');
+    setupAutocomplete('dest-input', 'dest-suggestions', 'dest');
+
+    async function resolvePoint(inputId, currentCoords) {
+      if (currentCoords) return currentCoords;
+      const val = document.getElementById(inputId).value.trim();
+      if (!val) throw new Error('Preencha origem e destino.');
+
+      const coordMatch = val.match(/^(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)$/);
+      if (coordMatch) return [parseFloat(coordMatch[1]), parseFloat(coordMatch[2])];
+
+      // Fallback automático: pega o primeiro resultado do Rio caso o usuário não tenha clicado na lista
+      const features = await searchRioPlaces(val);
+      if (!features.length) throw new Error(`Endereço não encontrado no RJ: "${val}". Selecione uma sugestão da lista.`);
+      const [lng, lat] = features[0].geometry.coordinates;
+      return [lat, lng];
+    }
+
+    async function calculateSafeRoute() {
+      const statusEl = document.getElementById('status');
+      const gmapsBtn = document.getElementById('gmaps-btn');
+      statusEl.textContent = 'Avaliando alternativas e índice de roubo de veículo...';
+      gmapsBtn.style.display = 'none';
+
+      try {
+        const origin = await resolvePoint('origin-input', selectedOrigin);
+        const destination = await resolvePoint('dest-input', selectedDest);
+
+        const resp = await fetch('/api/safe-route', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ origin, destination })
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || 'Erro ao calcular rota');
+
+        map.getSource('baseline-route').setData(data.baseline_geojson);
+        map.getSource('safe-route').setData(data.safe_geojson);
+
+        gmapsBtn.href = data.google_maps_url;
+        gmapsBtn.style.display = 'inline-block';
+
+        const cjScore = data.carjacking.carjacking_score;
+        const badgeClass = cjScore >= 50 ? 'badge-high' : (cjScore >= 25 ? 'badge-med' : 'badge-low');
+        const reasonText = data.selection_reason || (data.detour_applied ? 'Desvio de bloqueio aplicado' : 'Rota mais segura selecionada');
+        const precinctText = data.carjacking.high_risk_precincts.length
+          ? `<br/><strong>Delegacias críticas no trajeto (peso horário ${data.carjacking.time_multiplier}x):</strong> ${data.carjacking.high_risk_precincts.join(' • ')}`
+          : '';
+
+        statusEl.innerHTML = `<span class="badge ${badgeClass}">Risco Roubo: ${cjScore}/100</span> <strong>${reasonText}</strong> • ${data.duration_minutes} min (${data.distance_km} km)${precinctText}`;
+      } catch (err) {
+        statusEl.textContent = `Erro: ${err.message}`;
+      }
+    }
+  </script>
+</body>
+</html>
