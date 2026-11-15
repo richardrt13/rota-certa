@@ -710,3 +710,103 @@ async def compute_safe_route(req: RouteRequest):
         "safe_geojson": best["feature"],
         "google_maps_url": build_google_maps_url(req.origin, req.destination, waypoints),
     }
+
+
+@app.get("/api/autocomplete")
+async def autocomplete_places(q: str = ""):
+    query = q.strip()
+    if len(query) < 3:
+        return {"results": []}
+
+    results = []
+    try:
+        params = {
+            "text": query,
+            "boundary.country": "BRA",
+            "focus.point.lat": -22.9068,
+            "focus.point.lon": -43.1729,
+            "boundary.rect.min_lon": -43.796,
+            "boundary.rect.min_lat": -23.082,
+            "boundary.rect.max_lon": -43.099,
+            "boundary.rect.max_lat": -22.746,
+            "size": 6,
+        }
+        headers = {"Authorization": ORS_API_KEY}
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(
+                "https://api.openrouteservice.org/geocode/autocomplete",
+                params=params,
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                for feat in resp.json().get("features", []):
+                    props = feat.get("properties", {})
+                    coords = feat.get("geometry", {}).get("coordinates", [])
+                    if len(coords) < 2:
+                        continue
+                    main_name = props.get("name") or props.get("street") or "Local"
+                    if (
+                        props.get("street")
+                        and props.get("housenumber")
+                        and props.get("street") == main_name
+                    ):
+                        main_name = f"{props['street']}, {props['housenumber']}"
+                    sub_parts = [
+                        props.get("street") if props.get("street") != props.get("name") else None,
+                        props.get("neighbourhood") or props.get("borough"),
+                        props.get("locality") or props.get("county"),
+                    ]
+                    sub = " • ".join(p for p in sub_parts if p)
+                    full = props.get("label") or (f"{main_name} - {sub}" if sub else main_name)
+                    results.append({
+                        "main": main_name,
+                        "sub": sub,
+                        "full": full,
+                        "lat": float(coords[1]),
+                        "lng": float(coords[0]),
+                    })
+    except Exception:
+        pass
+
+    if not results:
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.get(
+                    "https://photon.komoot.io/api/",
+                    params={
+                        "q": query,
+                        "lat": -22.9068,
+                        "lon": -43.1729,
+                        "bbox": "-43.796,-23.082,-43.099,-22.746",
+                        "limit": 5,
+                    },
+                )
+                if resp.status_code == 200:
+                    for feat in resp.json().get("features", []):
+                        p = feat.get("properties", {})
+                        coords = feat.get("geometry", {}).get("coordinates", [])
+                        if len(coords) < 2:
+                            continue
+                        main_name = p.get("name") or p.get("street") or "Local"
+                        sub_parts = [
+                            p.get("street") if p.get("street") != main_name else None,
+                            p.get("district") or p.get("suburb"),
+                            p.get("city") or p.get("state"),
+                        ]
+                        sub = " • ".join(x for x in sub_parts if x)
+                        full = (
+                            f"{main_name} - {sub_parts[0]}"
+                            if sub_parts and sub_parts[0]
+                            else main_name
+                        )
+                        results.append({
+                            "main": main_name,
+                            "sub": sub,
+                            "full": full,
+                            "lat": float(coords[1]),
+                            "lng": float(coords[0]),
+                        })
+        except Exception:
+            pass
+
+    return {"results": results}
