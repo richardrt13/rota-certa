@@ -15,10 +15,10 @@
     .input-group { position: relative; flex: 1 1 250px; display: flex; gap: 4px; }
     input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #374151; background: #1f2937; color: #fff; font-size: 0.95rem; }
     input:focus { outline: none; border-color: #3b82f6; }
-    .suggestions { position: absolute; top: 100%; left: 0; right: 0; background: #1f2937; border: 1px solid #374151; border-radius: 8px; margin-top: 4px; max-height: 220px; overflow-y: auto; z-index: 50; display: none; box-shadow: 0 8px 16px rgba(0,0,0,0.5); }
+    .suggestions { position: absolute; top: 100%; left: 0; right: 0; background: #1f2937; border: 1px solid #374151; border-radius: 8px; margin-top: 4px; max-height: 240px; overflow-y: auto; z-index: 50; display: none; box-shadow: 0 8px 16px rgba(0,0,0,0.5); }
     .suggestion-item { padding: 10px 12px; cursor: pointer; border-bottom: 1px solid #374151; font-size: 0.88rem; }
     .suggestion-item:last-child { border-bottom: none; }
-    .suggestion-item:hover { background: #374151; }
+    .suggestion-item:hover, .suggestion-item.active { background: #374151; }
     .suggestion-sub { display: block; font-size: 0.78rem; color: #9ca3af; margin-top: 2px; }
     button { padding: 10px 14px; border-radius: 8px; border: none; background: #2563eb; color: #fff; font-weight: 600; cursor: pointer; font-size: 0.9rem; white-space: nowrap; }
     button:hover { background: #1d4ed8; }
@@ -38,7 +38,7 @@
 <body>
   <div id="controls">
     <div class="input-group">
-      <input id="origin-input" type="text" autocomplete="off" placeholder="Origem (digite rua/bairro ou use GPS)" />
+      <input id="origin-input" type="text" autocomplete="off" placeholder="Origem (rua, shopping, estação ou GPS)" />
       <button type="button" class="btn-secondary" onclick="useCurrentGPS()" title="Usar localização atual">📍 GPS</button>
       <div id="origin-suggestions" class="suggestions"></div>
     </div>
@@ -52,13 +52,11 @@
     <button type="button" id="pin-mode-btn" class="btn-secondary" onclick="togglePinMode()">+ Bloqueio no Mapa</button>
     <a id="gmaps-btn" href="#" target="_blank" rel="noopener">Abrir no Google Maps ↗</a>
 
-    <div id="status">Digite ao menos 3 letras para ver sugestões no RJ. Toque em um círculo vermelho para remover um bloqueio.</div>
+    <div id="status">Digite origem e destino ou clique no mapa. Toque em um círculo vermelho para remover um bloqueio.</div>
   </div>
   <div id="map"></div>
 
   <script>
-    const RIO_BBOX = '-43.796,-23.082,-43.099,-22.746';
-
     let selectedOrigin = null;
     let selectedDest = null;
     let originMarker = null;
@@ -228,7 +226,6 @@
         return;
       }
 
-      // Verifica se clicou sobre uma zona vermelha existente para permitir exclusão
       const hitZones = map.queryRenderedFeatures(e.point, { layers: ['avoid-fill'] });
       if (hitZones.length > 0) {
         const props = hitZones[0].properties;
@@ -255,24 +252,33 @@
       setMarker('dest', e.lngLat.lat, e.lngLat.lng, `${e.lngLat.lat.toFixed(5)}, ${e.lngLat.lng.toFixed(5)}`);
     });
 
-    function formatPhotonFeature(feat) {
-      const p = feat.properties || {};
-      const main = p.name || p.street || 'Local sem nome';
-      const subParts = [p.street !== main ? p.street : null, p.district || p.suburb, p.city || p.state].filter(Boolean);
-      return { main, sub: subParts.join(' • '), full: subParts.length ? `${main} - ${subParts[0]}` : main };
-    }
-
-    async function searchRioPlaces(query) {
-      const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&lat=-22.9068&lon=-43.1729&bbox=${RIO_BBOX}&limit=5`;
-      const res = await fetch(url);
+    async function fetchAutocomplete(query) {
+      const res = await fetch(`/api/autocomplete?q=${encodeURIComponent(query)}`);
+      if (!res.ok) return [];
       const data = await res.json();
-      return data.features || [];
+      return data.results || [];
     }
 
     function setupAutocomplete(inputId, listId, type) {
       const input = document.getElementById(inputId);
       const list = document.getElementById(listId);
       let timer = null;
+      let currentItems = [];
+      let activeIndex = -1;
+
+      function selectItem(item) {
+        setMarker(type, item.lat, item.lng, item.full);
+        list.style.display = 'none';
+        activeIndex = -1;
+        map.flyTo({ center: [item.lng, item.lat], zoom: 14 });
+      }
+
+      function highlightItem() {
+        const nodes = list.querySelectorAll('.suggestion-item[data-idx]');
+        nodes.forEach((node, idx) => {
+          node.classList.toggle('active', idx === activeIndex);
+        });
+      }
 
       input.addEventListener('input', () => {
         if (type === 'origin') selectedOrigin = null;
@@ -282,28 +288,30 @@
         const q = input.value.trim();
         if (q.length < 3) {
           list.style.display = 'none';
+          currentItems = [];
           return;
         }
 
         timer = setTimeout(async () => {
           try {
-            const features = await searchRioPlaces(q);
+            currentItems = await fetchAutocomplete(q);
+            activeIndex = -1;
             list.innerHTML = '';
-            if (!features.length) {
-              list.innerHTML = '<div class="suggestion-item">Nenhum endereço encontrado no RJ. Tente incluir o bairro.</div>';
+
+            if (!currentItems.length) {
+              list.innerHTML = '<div class="suggestion-item">Nenhum endereço encontrado.</div>';
               list.style.display = 'block';
               return;
             }
-            features.forEach((f) => {
-              const info = formatPhotonFeature(f);
-              const [lng, lat] = f.geometry.coordinates;
+
+            currentItems.forEach((item, idx) => {
               const div = document.createElement('div');
               div.className = 'suggestion-item';
-              div.innerHTML = `<strong>${info.main}</strong><span class="suggestion-sub">${info.sub}</span>`;
-              div.onclick = () => {
-                setMarker(type, lat, lng, info.full);
-                list.style.display = 'none';
-                map.flyTo({ center: [lng, lat], zoom: 13 });
+              div.dataset.idx = idx;
+              div.innerHTML = `<strong>${item.main}</strong><span class="suggestion-sub">${item.sub}</span>`;
+              div.onmousedown = (ev) => {
+                ev.preventDefault();
+                selectItem(item);
               };
               list.appendChild(div);
             });
@@ -312,6 +320,25 @@
             list.style.display = 'none';
           }
         }, 300);
+      });
+
+      input.addEventListener('keydown', (e) => {
+        if (list.style.display !== 'block' || !currentItems.length) return;
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          activeIndex = (activeIndex + 1) % currentItems.length;
+          highlightItem();
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          activeIndex = (activeIndex - 1 + currentItems.length) % currentItems.length;
+          highlightItem();
+        } else if (e.key === 'Enter') {
+          e.preventDefault();
+          const chosen = currentItems[activeIndex >= 0 ? activeIndex : 0];
+          if (chosen) selectItem(chosen);
+        } else if (e.key === 'Escape') {
+          list.style.display = 'none';
+        }
       });
 
       document.addEventListener('click', (e) => {
@@ -324,7 +351,7 @@
     setupAutocomplete('origin-input', 'origin-suggestions', 'origin');
     setupAutocomplete('dest-input', 'dest-suggestions', 'dest');
 
-    async function resolvePoint(inputId, currentCoords) {
+    async function resolvePoint(inputId, currentCoords, type) {
       if (currentCoords) return currentCoords;
       const val = document.getElementById(inputId).value.trim();
       if (!val) throw new Error('Preencha origem e destino.');
@@ -332,21 +359,21 @@
       const coordMatch = val.match(/^(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)$/);
       if (coordMatch) return [parseFloat(coordMatch[1]), parseFloat(coordMatch[2])];
 
-      const features = await searchRioPlaces(val);
-      if (!features.length) throw new Error(`Endereço não encontrado no RJ: "${val}". Selecione uma sugestão da lista.`);
-      const [lng, lat] = features[0].geometry.coordinates;
-      return [lat, lng];
+      const items = await fetchAutocomplete(val);
+      if (!items.length) throw new Error(`Endereço não encontrado: "${val}". Selecione uma sugestão da lista.`);
+      setMarker(type, items[0].lat, items[0].lng, items[0].full);
+      return [items[0].lat, items[0].lng];
     }
 
     async function calculateSafeRoute() {
       const statusEl = document.getElementById('status');
       const gmapsBtn = document.getElementById('gmaps-btn');
-      statusEl.textContent = 'Avaliando alternativas e índice de roubo de veículo...';
+      statusEl.textContent = 'Avaliando alternativas, vias arteriais e índice de roubo...';
       gmapsBtn.style.display = 'none';
 
       try {
-        const origin = await resolvePoint('origin-input', selectedOrigin);
-        const destination = await resolvePoint('dest-input', selectedDest);
+        const origin = await resolvePoint('origin-input', selectedOrigin, 'origin');
+        const destination = await resolvePoint('dest-input', selectedDest, 'dest');
 
         const resp = await fetch('/api/safe-route', {
           method: 'POST',
